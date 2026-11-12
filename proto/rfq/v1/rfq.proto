@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package rfq.v1;
+
+import "google/api/annotations.proto";
+import "rfq/v1/held.proto";
+
+option go_package = "github.com/skew-trade/skew-sdk/gen/rfq/v1;rfqv1";
+
+// RFQService is the public edge for a user's held orders: gRPC, and the REST paths below.
+//
+// A user's held order is ONE Hyperliquid limit order (Gtc) the user's app signed with its agent
+// key and has not sent, and the signed cancelByCloid of its cloid. Skew relays the order to
+// Hyperliquid byte for byte, behind the makers' held orders it matched it with; what does not fill
+// rests on Hyperliquid's book in the user's own account, and Skew sends the user's cancel at the
+// order's deadline. Skew holds no key.
+//
+// Every method requires the session JWT. The user is the JWT's subject: a caller can only place,
+// cancel and watch their own orders.
+//
+// ERRORS. Every error carries a stable machine-readable REASON in two places: as a "[REASON] "
+// prefix of the status message (the REST body then reads {"code":"REASON","message":"..."}) and
+// as an ErrorDetail in the status details. Branch on the reason, never on the text. The gRPC code
+// and the HTTP status the gateway maps it to are fixed per reason:
+//
+//	UNAUTHENTICATED          UNAUTHENTICATED     401  missing, malformed, bad or expired token
+//	BETA_REQUIRED            PERMISSION_DENIED   403  the token has no "beta" tag
+//	TAKER_MISMATCH           PERMISSION_DENIED   403  the order's account is not the token's subject
+//	INVALID_ARGUMENT         INVALID_ARGUMENT    400  a request constraint failed (violations lists the fields)
+//	NOT_FOUND                NOT_FOUND           404  no such order (also another user's)
+//	RATE_LIMITED             RESOURCE_EXHAUSTED  429  a token bucket is empty; retry_after_ms says when
+//	TOO_MANY_STREAMS         RESOURCE_EXHAUSTED  429  too many concurrent streams
+//	CURSOR_TOO_OLD           OUT_OF_RANGE        400  the stream cursor is outside the replay window
+//	UNAVAILABLE              UNAVAILABLE         503  a dependency is down, or the deployment does not match held orders; retry
+//	INTERNAL                 INTERNAL            500  a bug; the message is generic on purpose
+//
+// A request that is well formed and allowed but that the edge declines (book not open, geofenced,
+// screened, a rule of the order broken) is NOT an error: the place and cancel routes answer 200
+// with a refusal (UserHeldRefusal).
+service RFQService {
+  // ---- held orders: served where the deployment matches them (else UNAVAILABLE) ----
+
+  // GetUserHeldTerms is what the app signs to for one book: the two assets, the tick, the minimum
+  // value, the network, the time in force, the bounds of place.expiresAfter, of the deadline and of
+  // the cancel, the caps and the server's clock.
+  rpc GetUserHeldTerms(GetUserHeldTermsRequest) returns (GetUserHeldTermsResponse) {
+    option (google.api.http) = {get: "/api/v1/rfq/held/books/{book}/terms"};
+  }
+
+  // PlaceUserHeldOrder takes the user's held order and its deadline. The account must be the
+  // token's subject (TAKER_MISMATCH). The edge runs the geofence, screening and the kill switch,
+  // then checks the order as carefully as a maker's (the signer recovered over the canonical
+  // action, the signer the account's own key or an API wallet Hyperliquid lists for it, the asset,
+  // the tick, whole shares, the 1 USDC minimum, the nonces, the lives) with the user's rules (Gtc,
+  // the deadline, the cancel's nonce at or past the deadline), records it RECEIVED and hands it to
+  // the matcher. A well-formed order it declines is a 200 with a refusal. Idempotent by the order
+  // id: the same signed bytes placed again answer the order's view.
+  rpc PlaceUserHeldOrder(PlaceUserHeldOrderRequest) returns (PlaceUserHeldOrderResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/rfq/held/orders"
+      body: "*"
+    };
+  }
+
+  // CancelUserHeldOrder asks for the user's cancel now instead of at the deadline. An order the
+  // matcher has not taken ends CANCELLED at once, never sent; otherwise Skew relays the user's
+  // pre-signed cancel as soon as the order rests. Idempotent.
+  rpc CancelUserHeldOrder(CancelUserHeldOrderRequest) returns (CancelUserHeldOrderResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/rfq/held/orders/{order_id}/cancel"
+      body: "*"
+    };
+  }
+
+  // GetUserHeldOrder returns one of the caller's held orders; another user's is NOT_FOUND.
+  rpc GetUserHeldOrder(GetUserHeldOrderRequest) returns (GetUserHeldOrderResponse) {
+    option (google.api.http) = {get: "/api/v1/rfq/held/orders/{order_id}"};
+  }
+
+  // ListUserHeldOrders lists the caller's held orders, newest first.
+  rpc ListUserHeldOrders(ListUserHeldOrdersRequest) returns (ListUserHeldOrdersResponse) {
+    option (google.api.http) = {get: "/api/v1/rfq/held/orders"};
+  }
+
+  // WatchUserHeldOrders streams the caller's held orders as they change: over REST a chunked
+  // response of newline-delimited JSON, one {"result": UserHeldOrderUpdate} per line. Cursors count
+  // the caller's changes from 1 without gaps; reconnect with the last one processed. An idle stream
+  // carries heartbeats.
+  rpc WatchUserHeldOrders(WatchUserHeldOrdersRequest) returns (stream UserHeldOrderUpdate) {
+    option (google.api.http) = {get: "/api/v1/rfq/held/updates"};
+  }
+}
+
+// ErrorDetail rides in google.rpc.Status.details of every error the edge
+// returns (see the table on RFQService). The gateway renders it in the REST
+// body's "details" array.
+message ErrorDetail {
+  // The stable reason, e.g. "RATE_LIMITED".
+  string reason = 1;
+  // For retryable errors: how long to wait before trying again, in
+  // milliseconds. Zero means "no hint".
+  uint32 retry_after_ms = 2;
+  // INVALID_ARGUMENT only: one entry per failed constraint.
+  repeated FieldViolation violations = 3;
+  // Context that is safe to show, e.g. {"bucket":"quote-address"}.
+  map<string, string> metadata = 4;
+}
+
+// FieldViolation is one failed request constraint.
+message FieldViolation {
+  // The field path, e.g. "shares".
+  string field = 1;
+  // What is wrong, in words.
+  string description = 2;
+}

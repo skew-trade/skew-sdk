@@ -1,0 +1,14 @@
+# Go: the wire types and gRPC clients, into ../gen (committed). protoc-gen-go v1.36.10 and
+# protoc-gen-go-grpc v1.4.0 (they stamp their versions into every file).
+version: v2
+managed:
+  enabled: true
+plugins:
+  - local: protoc-gen-go
+    out: ../gen
+    opt:
+      - module=github.com/skew-trade/skew-sdk/gen
+  - local: protoc-gen-go-grpc
+    out: ../gen
+    opt:
+      - module=github.com/skew-trade/skew-sdk/gen

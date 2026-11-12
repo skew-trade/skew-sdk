@@ -1,0 +1,46 @@
+{
+  "name": "@skew-trade/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Skew RFQ's TypeScript SDK. \".\" is the app SDK: a user's held orders (planned from the book's terms, signed by an injected agent signer, placed, cancelled, read and followed), the public markets feed and Hyperliquid's L1 signing. \"./maker\" is the maker SDK: firm held orders signed, replaced and withdrawn per book, listed, and the event feed followed.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./maker": {
+      "types": "./dist/maker.d.ts",
+      "default": "./dist/maker.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && node scripts/esm-specifiers.mjs dist",
+    "typecheck": "tsc --noEmit --pretty false",
+    "typecheck:test": "tsc -p tsconfig.test.json --noEmit --pretty false",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.13.0",
+    "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "2.13.0",
+    "@types/node": "24.19.1",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "viem": "2.57.3"
+  }
+}

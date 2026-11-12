@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - name: builds without cgo
+        run: CGO_ENABLED=0 go build ./...
+
+  typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run typecheck:test
+      - run: npm test
+      - run: npm run build
+      - name: the built entry points load in Node
+        run: node --input-type=module -e 'await import("./dist/index.js"); await import("./dist/maker.js")'
+      - run: npm pack --dry-run
+
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the scan reads every commit's author, committer and message
+      - run: scripts/privacy-scan.sh
+        env:
+          PRIVACY_WORDS: ${{ secrets.SKEW_PRIVACY_WORDS }}
+          # A fork's pull request gets no secrets.
+          PRIVACY_SCAN_OPTIONAL: ${{ github.event.pull_request.head.repo.fork && '1' || '' }}

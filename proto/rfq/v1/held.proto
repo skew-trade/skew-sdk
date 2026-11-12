@@ -1,0 +1,690 @@
+syntax = "proto3";
+
+package rfq.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/skew-trade/skew-sdk/gen/rfq/v1;rfqv1";
+
+// HeldOrderService is the MAKER edge of the held orders (docs/MAKER-SPEC.md): gRPC and
+// the REST paths below, all under /api/v1/held/.
+//
+// A HELD ORDER is one Hyperliquid order a maker signed and has NOT sent: the signed `order` action
+// carrying exactly one order (`place`) and the signed `cancelByCloid` of the same cloid (`clear`).
+// Skew holds both and may relay them to Hyperliquid's API, byte for byte, at any time before the
+// order's expiresAfter: the order first, then the taker's order against it, then the cancel for
+// whatever is left. Skew holds no key and changes nothing of what was signed. GetBookRules' `mode`
+// says what the deployment does with them: "match", they are matched with users' orders and relayed
+// as above; "ingest", they are accepted, validated, held and expired, and nothing is sent.
+//
+// A maker updates ONE BOOK (one outcome) at a time: ReplaceBookOrders replaces all of the caller's
+// held orders on that book in one transaction, under a `seq` that must grow per (maker, book). The
+// caller's other books are untouched.
+//
+// AUTHENTICATION. Every method needs the maker's API key in the `X-Skew-Maker-Key` header (gRPC
+// metadata `x-skew-maker-key`). An unknown key is UNAUTHENTICATED (401), a disabled maker FORBIDDEN
+// (403), neither with any detail. There is no session JWT here.
+//
+// ERRORS are RFQService's (the "[REASON] " message prefix and the ErrorDetail): UNAUTHENTICATED 401,
+// FORBIDDEN 403, INVALID_ARGUMENT 400, NOT_FOUND 404, RATE_LIMITED 429 (retry_after_ms),
+// TOO_MANY_STREAMS 429, UNAVAILABLE 503, INTERNAL 500. A well-formed update the pool declines is NOT
+// an error: ReplaceBookOrders answers 200 with `applied` false and a `code`, and each order gets its
+// own verdict. A call is admitted, or refused, from its headers, before its body is read: over gRPC
+// such a refusal has its status code and message alone, the reason and the wait in the message.
+service HeldOrderService {
+  // GetBookRules is everything a maker needs to build held orders for one book: the two asset ids,
+  // the tick, the minimum order value, the network the signatures are checked for, the life
+  // limits, the caller's limits and accounts, the book's last applied seq and the server's clock.
+  rpc GetBookRules(GetHeldBookRulesRequest) returns (GetHeldBookRulesResponse) {
+    option (google.api.http) = {get: "/api/v1/held/books/{book}/rules"};
+  }
+
+  // ReplaceBookOrders replaces ALL of the caller's held orders on one book. Each order is checked
+  // on its own and gets a verdict (code ACCEPTED, or the rule it broke with a sentence to act on).
+  // Not strict: the accepted orders become the book's live set and the caller's previous live
+  // orders on the book are REPLACED, whether or not any new order was accepted. Strict: one refused
+  // order refuses the whole update (code STRICT_REFUSED) and nothing changes: the previous orders
+  // stay live and `seq` is not consumed. An order of the previous set sent again unchanged (the
+  // same signed bytes) is kept as it is (`kept` in its verdict). Orders already claimed for
+  // sending are never touched. `seq` must be greater than the book's last applied seq, else
+  // STALE_SEQ and nothing changes. An update with no orders empties the book.
+  rpc ReplaceBookOrders(ReplaceHeldBookOrdersRequest) returns (ReplaceHeldBookOrdersResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/held/books/{book}/orders"
+      body: "*"
+    };
+  }
+
+  // WithdrawBook withdraws every live held order of the caller on one book (or, with all_books,
+  // on every book). `seq` 0 takes the book's next seq; a set seq must be greater than the last
+  // applied one (STALE_SEQ). Orders already claimed for sending are not withdrawn: they run to
+  // their end within seconds.
+  rpc WithdrawBook(WithdrawHeldBookRequest) returns (WithdrawHeldBookResponse) {
+    option (google.api.http) = {
+      post: "/api/v1/held/books/{book}/withdraw"
+      body: "*"
+      additional_bindings: {
+        post: "/api/v1/held/withdraw"
+        body: "*"
+      }
+    };
+  }
+
+  // ListOrders lists the caller's held orders, newest first, by book and state. One call looks at a
+  // bounded number of orders, so a page may hold fewer than the limit, even none, and still carry a
+  // token: the listing has ended when there is no next_page_token.
+  rpc ListOrders(ListHeldOrdersRequest) returns (ListHeldOrdersResponse) {
+    option (google.api.http) = {get: "/api/v1/held/orders"};
+  }
+
+  // GetOrder returns one of the caller's held orders. Another maker's is NOT_FOUND.
+  rpc GetOrder(GetHeldOrderRequest) returns (GetHeldOrderResponse) {
+    option (google.api.http) = {get: "/api/v1/held/orders/{order_id}"};
+  }
+
+  // WatchOrders streams what happens to the caller's held orders: accepted, replaced, withdrawn and
+  // expired, and, when a match takes them, claimed, released, posted, filled, part_filled, cleared
+  // and failed. Over REST it is a chunked response of newline-delimited JSON, one {"result": HeldOrderEvent}
+  // per line. Every event has a cursor: reconnect with the last one processed AND its epoch, and the
+  // stream resumes after it. Neither a cursor nor an epoch starts at the events from now on, and
+  // nothing is replayed. When it cannot resume, the
+  // stream says so with a `reset` event, whose reset_reason says what to do. An idle stream carries
+  // heartbeats (type "heartbeat", no orders, the cursor to resume from and its epoch).
+  rpc WatchOrders(WatchHeldOrdersRequest) returns (stream HeldOrderEvent) {
+    option (google.api.http) = {get: "/api/v1/held/events"};
+  }
+}
+
+// HeldOrderState is where a held order stands.
+//
+//	LIVE -> CLAIMED -> POSTED -> FILLED | PART_FILLED | CLEARED | FAILED
+//	LIVE -> REPLACED | WITHDRAWN | EXPIRED
+enum HeldOrderState {
+  HELD_ORDER_STATE_UNSPECIFIED = 0;
+  // Held: Skew may relay it at any time before valid_until.
+  HELD_ORDER_STATE_LIVE = 1;
+  // Taken by the matcher for one pairing; it is being sent.
+  HELD_ORDER_STATE_CLAIMED = 2;
+  // Hyperliquid answered resting: the order is on the book under `oid`.
+  HELD_ORDER_STATE_POSTED = 3;
+  // Filled in full.
+  HELD_ORDER_STATE_FILLED = 4;
+  // Filled in part; the rest was cleared with the pre-signed cancel.
+  HELD_ORDER_STATE_PART_FILLED = 5;
+  // Posted, nothing filled, cleared with the pre-signed cancel.
+  HELD_ORDER_STATE_CLEARED = 6;
+  // The send failed or Hyperliquid refused the order; `reason` says why.
+  HELD_ORDER_STATE_FAILED = 7;
+  // A later book update replaced it before it was claimed.
+  HELD_ORDER_STATE_REPLACED = 8;
+  // The maker withdrew the book before it was claimed.
+  HELD_ORDER_STATE_WITHDRAWN = 9;
+  // valid_until passed before it was claimed.
+  HELD_ORDER_STATE_EXPIRED = 10;
+}
+
+// HeldSignature is an ECDSA signature as Hyperliquid's /exchange body carries it. It is checked
+// per order (BAD_SIGNATURE), not as a request constraint: one bad order does not fail the update.
+message HeldSignature {
+  // 0x-hex scalars, minimal or zero-padded.
+  string r = 1;
+  string s = 2;
+  // 27 or 28 (0 or 1 are read as 27 or 28).
+  uint32 v = 3;
+}
+
+// HeldSigned is ONE signed Hyperliquid L1 action, exactly the JSON body its signer would POST to
+// Hyperliquid's /exchange: {"action": {...}, "nonce": ..., "signature": {"r","s","v"},
+// "expiresAfter": ...}. A "vaultAddress": null is accepted; a set one is refused
+// (VAULT_NOT_ALLOWED).
+message HeldSigned {
+  // The action, as a JSON object. The pool reads it field by field, rebuilds the action in
+  // Hyperliquid's own key order and checks the signature over that: what it relays is that
+  // canonical action with this nonce, signature and expiresAfter, and nothing else.
+  google.protobuf.Struct action = 1;
+  // The request nonce the signer signed: unix ms, unique per signer.
+  uint64 nonce = 2;
+  HeldSignature signature = 3;
+  // unix ms, inside the signed hash. Required on both actions.
+  uint64 expires_after = 4;
+  // Must be absent or null: v1 takes no vault or sub-account orders.
+  string vault_address = 5;
+}
+
+// HeldOrder is one held order as a maker submits it: who trades, who signed, the signed order and
+// the signed cancel of the same cloid. Everything else (the asset, the side, the price, the size,
+// the cloid, valid_until) is read from `place`.
+message HeldOrder {
+  // The Hyperliquid account that trades: one of the caller's allowlisted accounts. 0x + 40 hex.
+  string account = 1;
+  // The address whose key signed both actions: the account itself, or an API wallet Hyperliquid
+  // lists for it. Empty: the account.
+  string signer = 2;
+  // The `order` action with exactly one order.
+  HeldSigned place = 3;
+  // The `cancelByCloid` action for the same asset and cloid, under another nonce.
+  HeldSigned clear = 4;
+}
+
+// HeldVerdict is the pool's answer to one order of an update.
+message HeldVerdict {
+  // The order's position in the request.
+  uint32 index = 1;
+  // The order's cloid, when the pool could read one.
+  string cloid = 2;
+  // The pool's id of the order (ACCEPTED only): 0x + 32 hex.
+  string order_id = 3;
+  // ACCEPTED, or the stable code of the rule the order broke (MAKER-SPEC §8).
+  string code = 4;
+  // A sentence a maker can act on. Text is not stable; the code is.
+  string reason = 5;
+  // ACCEPTED only: the order was already live from an earlier update and stays as it was.
+  bool kept = 6;
+}
+
+// HeldOrderView is a held order as its maker sees it. It carries no signature.
+message HeldOrderView {
+  string order_id = 1;
+  string account = 2;
+  string signer = 3;
+  // The outcome id.
+  uint32 book = 4;
+  // 100,000,000 + 10 * book + side
+  uint64 asset = 5;
+  // 0 Yes, 1 No
+  uint32 side = 6;
+  bool is_buy = 7;
+  // Canonical decimal strings, as signed.
+  string px = 8;
+  string sz = 9;
+  // "Alo"
+  string tif = 10;
+  string cloid = 11;
+  // The book update that brought it.
+  uint64 seq = 12;
+  HeldOrderState state = 13;
+  // FAILED: why.
+  string reason = 14;
+  // place.expiresAfter: the order is never relayed after it.
+  google.protobuf.Timestamp valid_until = 15;
+  // clear.expiresAfter: the pre-signed cancel works until then.
+  google.protobuf.Timestamp clear_until = 16;
+  uint64 place_nonce = 17;
+  uint64 clear_nonce = 18;
+  google.protobuf.Timestamp created_at = 19;
+  google.protobuf.Timestamp updated_at = 20;
+  // POSTED and later: Hyperliquid's order id.
+  uint64 oid = 21;
+  // FILLED, PART_FILLED: whole shares filled.
+  uint64 filled_sz = 22;
+}
+
+// HeldLimits are the caller's limits (0: none).
+message HeldLimits {
+  // The most orders one book update may carry.
+  uint32 orders_per_book = 1;
+  // The most books the caller may hold live orders on.
+  uint32 books = 2;
+  // The largest order, whole shares.
+  uint64 max_order_size = 3;
+  // The largest order's own value (size x price), micro-USDC.
+  uint64 max_order_notional_micro = 4;
+  // With the capacity rule on (capacity_rule): the caller's margin on everything one of its
+  // accounts quotes, in bps of 10,000 (1000: one tenth). An order of value a on a book is admitted
+  // while (quoted on every book + a) x capacity_margin_bps / 10,000 <= the account's free USDC.
+  uint32 capacity_margin_bps = 5;
+  // With the capacity rule on, and only when the caller's limits set one for THIS book: the most
+  // one of its accounts may stand on the book, micro-USDC. An account never stands deeper on a book
+  // than its free USDC in any case; absent, that alone binds.
+  optional uint64 max_depth_micro = 6;
+}
+
+message GetHeldBookRulesRequest {
+  // The outcome id.
+  uint32 book = 1;
+}
+
+message GetHeldBookRulesResponse {
+  uint32 book = 1;
+  // The book's two assets: 100,000,000 + 10 * book + side (0 Yes, 1 No), and their book coins.
+  uint64 yes_asset = 2;
+  uint64 no_asset = 3;
+  string yes_coin = 4;
+  string no_coin = 5;
+  // "0.00001": a price is a canonical decimal on this tick, strictly between 0 and 1.
+  string tick = 6;
+  uint32 px_decimals = 7;
+  // 0: sizes are whole shares.
+  uint32 sz_decimals = 8;
+  // An order's own value, size x price, must be at least this (1 USDC = 1000000).
+  uint64 min_order_value_micro = 9;
+  // The Hyperliquid chain the signatures are checked for, as Hyperliquid names it ("Mainnet"): the
+  // phantom agent's source is "a" on Mainnet. A signature made for another chain recovers a
+  // stranger (SIGNER_MISMATCH).
+  string hyperliquid_chain = 10;
+  // The Hyperliquid API this deployment relays to.
+  string hyperliquid_api = 11;
+  // The times in force a maker's order may carry: ["Alo"].
+  repeated string tifs = 12;
+  // place.expiresAfter must be between server_time + min_life_ms and server_time + max_life_ms;
+  // clear.expiresAfter between place.expiresAfter + clear_grace_ms and place.expiresAfter +
+  // clear_max_ms.
+  uint64 min_life_ms = 13;
+  uint64 max_life_ms = 14;
+  uint64 clear_grace_ms = 15;
+  // A nonce (unix ms) must lie within this window around the server's clock: at most
+  // nonce_max_age_ms behind it and nonce_max_ahead_ms ahead of it (47 h and 23 h: inside
+  // Hyperliquid's own window, which was measured on Hyperliquid on 2026-11-06 to end about 23 h 58
+  // min ahead). A nonce dated ahead survives the signer's other traffic (MAKER-SPEC §4).
+  uint64 nonce_max_age_ms = 16;
+  uint64 nonce_max_ahead_ms = 17;
+  HeldLimits limits = 18;
+  // The caller's last applied seq on this book (0: none yet).
+  uint64 seq = 19;
+  // Whether the book takes orders now (it is one of Skew's listed, unexpired markets).
+  bool open = 20;
+  // The market's expiry, when the market list knows it.
+  google.protobuf.Timestamp expiry = 21;
+  // The server's clock: what expiresAfter and nonces are checked against.
+  google.protobuf.Timestamp server_time = 22;
+  // The caller: its id, its name and its allowlisted Hyperliquid accounts.
+  string maker_id = 23;
+  string maker_name = 24;
+  repeated string accounts = 25;
+  // What the deployment does with held orders: "match", they are matched with users' orders and
+  // relayed to Hyperliquid; "ingest", they are accepted, validated, held and expired, and nothing is
+  // sent.
+  string mode = 26;
+  // Whether the capacity rule is on (CAPACITY verdicts); its terms for the caller are in limits.
+  bool capacity_rule = 27;
+  // The pool never sends an order with less than this left before its place.expiresAfter: an
+  // action that reaches Hyperliquid after its expiresAfter is refused, spends its nonce and costs
+  // its signer 5 requests (measured on Hyperliquid on 2026-11-06).
+  uint64 send_margin_ms = 28;
+  // clear.expiresAfter is at most place.expiresAfter + clear_max_ms (CLEAR_EXPIRES_TOO_LATE past
+  // it): every time a client supplies is bounded on both sides.
+  uint64 clear_max_ms = 29;
+  // The epoch of this run of the pool. The pool lives in memory: a restart starts it empty under a
+  // new epoch, every book's seq starts again from 0, and nothing a maker sent before is held. A
+  // maker that sees the epoch change sends every book again.
+  string epoch = 30;
+}
+
+message ReplaceHeldBookOrdersRequest {
+  // The outcome id.
+  uint32 book = 1;
+  // Must be greater than the book's last applied seq for this maker. Any growing number works;
+  // unix ms is the usual choice.
+  uint64 seq = 2;
+  // The book's whole new set (at most 64 in one request; the caller's own limit is in
+  // GetBookRules).
+  repeated HeldOrder orders = 3;
+  // All or nothing: one refused order refuses the update and nothing changes.
+  bool strict = 4;
+}
+
+message ReplaceHeldBookOrdersResponse {
+  // Whether the update was applied. False: `code` says why and nothing changed.
+  bool applied = 1;
+  // When not applied: STALE_SEQ, STRICT_REFUSED, BOOK_NOT_OPEN or TOO_MANY_BOOKS.
+  string code = 2;
+  string reason = 3;
+  uint32 book = 4;
+  // The book's last applied seq after this call.
+  uint64 seq = 5;
+  // One per order of the request, in order.
+  repeated HeldVerdict verdicts = 6;
+  // The caller's live orders on the book after this call.
+  repeated HeldOrderView live = 7;
+  // The ids of the orders this update replaced.
+  repeated string replaced = 8;
+  google.protobuf.Timestamp server_time = 9;
+}
+
+message WithdrawHeldBookRequest {
+  // The outcome id; 0 only with all_books.
+  uint32 book = 1;
+  // 0: the book's next seq. Set: must be greater than the last applied one.
+  uint64 seq = 2;
+  // Withdraw every book of the caller (book must be 0).
+  bool all_books = 3;
+}
+
+message WithdrawHeldBookResponse {
+  bool applied = 1;
+  // When not applied: STALE_SEQ.
+  string code = 2;
+  string reason = 3;
+  // The ids of the orders withdrawn.
+  repeated string withdrawn = 4;
+  // The book's last applied seq after this call (one book only).
+  uint64 seq = 5;
+  google.protobuf.Timestamp server_time = 6;
+}
+
+message ListHeldOrdersRequest {
+  // Only this book (0: every book).
+  uint32 book = 1;
+  // Empty means every state.
+  repeated HeldOrderState states = 2;
+  // Page size; 0 means the default (100).
+  uint32 limit = 3;
+  // Opaque; from the previous response.
+  string page_token = 4;
+  // Only the order with this cloid.
+  string cloid = 5;
+}
+
+message ListHeldOrdersResponse {
+  repeated HeldOrderView orders = 1;
+  string next_page_token = 2;
+}
+
+message GetHeldOrderRequest {
+  string order_id = 1;
+}
+
+message GetHeldOrderResponse {
+  HeldOrderView order = 1;
+}
+
+message WatchHeldOrdersRequest {
+  // Resume after this cursor, with its epoch. Neither: the events from now on, nothing replayed.
+  uint64 cursor = 1;
+  // Only this book (0: every book).
+  uint32 book = 2;
+  // The epoch the cursor belongs to: the epoch of the last heartbeat (or reset) the client saw.
+  // REQUIRED with a cursor other than 0. With this run's epoch the cursor is a position, 0 included:
+  // the stream replays what came after it. The pool lives in memory and every run of it has its own
+  // epoch; cursors count from 1 again in each. A cursor of another epoch is answered with a
+  // `reset` whose reset_reason is POOL_EMPTY; a cursor without an epoch, or one this epoch's feed
+  // no longer reaches, with a `reset` whose reset_reason is EVENTS_MISSED.
+  string epoch = 3;
+}
+
+// HeldEventOrder is one order of an event: its ids and where it stands after the event.
+message HeldEventOrder {
+  string order_id = 1;
+  string cloid = 2;
+  HeldOrderState state = 3;
+  // failed: why, as one stable word (MAKER-SPEC §10: NONCE_TOO_LOW, NONCE_SPENT, SIGNER_REVOKED,
+  // POST_WOULD_CROSS, ...).
+  string reason = 4;
+  // posted and later: Hyperliquid's order id.
+  uint64 oid = 5;
+  // filled, part_filled: whole shares filled.
+  uint64 filled_sz = 6;
+}
+
+// HeldOrderEvent is one thing that happened to the caller's held orders on one book.
+message HeldOrderEvent {
+  // Resume after it.
+  uint64 cursor = 1;
+  // accepted, replaced, withdrawn, expired (the book's); claimed, released, posted, filled,
+  // part_filled, cleared, failed (a match's); heartbeat; reset (the stream cannot go on from
+  // the client's cursor: reset_reason says why and what to do; the stream goes on from this
+  // event's cursor under this event's epoch). Ignore a type you do not know.
+  string type = 2;
+  uint32 book = 3;
+  // accepted, replaced, withdrawn: the book update's seq.
+  uint64 seq = 4;
+  repeated HeldEventOrder orders = 5;
+  google.protobuf.Timestamp time = 6;
+  // heartbeat, reset: the epoch of the pool's run the cursor belongs to. Send it back with the
+  // cursor when reconnecting.
+  string epoch = 7;
+  // reset only: why.
+  //   POOL_EMPTY     the pool restarted after the client's cursor (another epoch). It holds NONE of
+  //                  the orders the client sent before: send every book again. Every seq starts
+  //                  from 0.
+  //   EVENTS_MISSED  events between the client's cursor and this one cannot be sent: the feed no
+  //                  longer keeps them (the stream fell behind, or was away longer than the feed
+  //                  reaches), or the cursor came without its epoch. The client's orders MAY STILL
+  //                  BE LIVE: read them (ListOrders with state LIVE), or send every book again,
+  //                  which is always safe.
+  string reset_reason = 8;
+}
+
+// ---- the USER's held order, served on RFQService ----
+//
+// The same object a maker hands in (HeldOrder), with a Gtc limit order in `place`: the user's app
+// signs both actions with the agent key it keeps for the user's Hyperliquid account. The routes are
+// RFQService's (the session JWT, the beta gate, the geofence and the edge's limits apply), under
+// /api/v1/rfq/held/; a deployment that does not match held orders answers them UNAVAILABLE.
+
+// UserHeldOrderState is where a user's held order stands.
+//
+//	RECEIVED -> MATCHING -> POSTING -> SENDING -> CLEARING -> FILLED | RESTING | REJECTED | EXPIRED
+//	RESTING  -> CANCELLING -> CANCELLED | FILLED | LAPSED
+enum UserHeldOrderState {
+  USER_HELD_ORDER_STATE_UNSPECIFIED = 0;
+  // Recorded; nothing sent.
+  USER_HELD_ORDER_STATE_RECEIVED = 1;
+  // The matcher holds it; nothing sent.
+  USER_HELD_ORDER_STATE_MATCHING = 2;
+  // The makers' post-only orders are going out.
+  USER_HELD_ORDER_STATE_POSTING = 3;
+  // The user's order is going out.
+  USER_HELD_ORDER_STATE_SENDING = 4;
+  // The user's answer is known; the makers' cancels are going out.
+  USER_HELD_ORDER_STATE_CLEARING = 5;
+  // Sent; a remainder rests on Hyperliquid in the user's account until the deadline.
+  USER_HELD_ORDER_STATE_RESTING = 6;
+  // The user's cancel is going out (the one signed with the request, or at the deadline the one
+  // the order was placed with). With the reason PLACE_UNKNOWN, a send of the order had no answer and
+  // no read shows it: it may or may not rest, and this cancel settles it.
+  USER_HELD_ORDER_STATE_CANCELLING = 7;
+  // Filled in full.
+  USER_HELD_ORDER_STATE_FILLED = 8;
+  // Ended by a cancel; filled_sz says what filled before. `reason`: DEADLINE, REQUESTED, BEFORE_SEND,
+  // AT_VENUE (the order ended on Hyperliquid by another hand: the user's own cancel there, or its
+  // market closed), or PLACE_UNKNOWN (Skew had no answer for a send; `sent` says whether it knows the
+  // order was there). Fills that show later correct an order that ended PLACE_UNKNOWN.
+  USER_HELD_ORDER_STATE_CANCELLED = 9;
+  // Refused, by the matcher's check before sending or by Hyperliquid when sent; `reason` says why.
+  USER_HELD_ORDER_STATE_REJECTED = 10;
+  // place.expiresAfter or the deadline came first. PLACE_EXPIRED, DEADLINE: never sent. PLACE_UNKNOWN:
+  // Skew had no answer for a send, its cancel found nothing open and no fill of it shows so far; fills
+  // that show later correct it to FILLED or CANCELLED, as a new change in the feed.
+  USER_HELD_ORDER_STATE_EXPIRED = 11;
+  // A remainder may still rest and Skew cannot cancel it: cancel it on Hyperliquid. resting_sz is what
+  // may rest. `reason`: CANCEL_LAPSED, CANCEL_REFUSED, or CLOID_REUSED (the user used the order's cloid
+  // again on Hyperliquid, so a cancel by it would reach that other order: `detail` says how to end this
+  // one).
+  USER_HELD_ORDER_STATE_LAPSED = 12;
+}
+
+// UserHeldFill is one maker order of the match, a LEG, as the user sees it: its price and what filled
+// of it BY ANYONE (another party may have taken the part this user did not). It is not the user's own
+// fill: that is filled_sz and avg_px on UserHeldOrderView. It never names the maker, nor shows the
+// size of the maker's order.
+message UserHeldFill {
+  // The price on the user's own asset, a canonical decimal string.
+  string px = 1;
+  // Whole shares filled of the leg, by anyone: sz and filled_sz are the same number (sz once carried
+  // the maker's whole order, which is the maker's own business).
+  uint64 sz = 2;
+  uint64 filled_sz = 3;
+  // posted, filled, part_filled, cleared, failed or released.
+  string state = 4;
+}
+
+// UserHeldOrderView is a user's held order as they see it: no signature, no body.
+message UserHeldOrderView {
+  // 0x + 32 hex: the same signed bytes always have the same id.
+  string order_id = 1;
+  string account = 2;
+  string signer = 3;
+  // The outcome id.
+  uint32 book = 4;
+  uint64 asset = 5;
+  // 0 Yes, 1 No.
+  uint32 side = 6;
+  bool is_buy = 7;
+  // The limit and the size as signed (canonical decimal strings), and the time in force ("Gtc").
+  string px = 8;
+  string sz = 9;
+  string tif = 10;
+  // 0x + 32 hex: the order's client order id on Hyperliquid.
+  string cloid = 11;
+  UserHeldOrderState state = 12;
+  // REJECTED, EXPIRED, CANCELLED, LAPSED: why, as one stable word, and the sentence.
+  string reason = 13;
+  string detail = 14;
+  // Whether the order was relayed to Hyperliquid, and when.
+  bool sent = 15;
+  google.protobuf.Timestamp sent_at = 16;
+  // Hyperliquid's order id.
+  uint64 oid = 17;
+  // The user's own fill: whole shares filled, their average price, and what rests on Hyperliquid in
+  // the user's account (CANCELLING and LAPSED: what may rest).
+  uint64 filled_sz = 18;
+  string avg_px = 19;
+  uint64 resting_sz = 20;
+  // When Skew cancels what still rests; place.expiresAfter; clear.expiresAfter.
+  google.protobuf.Timestamp deadline = 21;
+  google.protobuf.Timestamp valid_until = 22;
+  google.protobuf.Timestamp clear_until = 23;
+  // The user asked for the cancel.
+  bool cancel_requested = 24;
+  // How this deployment sends matches: "await" or "together", as the terms' send_mode says.
+  string mode = 25;
+  // The makers' orders the match posted for it: the legs, not the user's own fills (filled_sz, avg_px).
+  repeated UserHeldFill fills = 26;
+  google.protobuf.Timestamp created_at = 27;
+  google.protobuf.Timestamp updated_at = 28;
+  // The position of the order's last change in the user's stream.
+  uint64 cursor = 29;
+}
+
+message GetUserHeldTermsRequest {
+  // The outcome id.
+  uint32 book = 1;
+}
+
+// GetUserHeldTermsResponse is what the app signs to.
+message GetUserHeldTermsResponse {
+  uint32 book = 1;
+  // 100,000,000 + 10 * book + side, and the coins' names ("#<10*book+side>").
+  uint64 yes_asset = 2;
+  uint64 no_asset = 3;
+  string yes_coin = 4;
+  string no_coin = 5;
+  // "0.00001", 5 price decimals, whole shares, 1 USDC on the order's own value.
+  string tick = 6;
+  uint32 px_decimals = 7;
+  uint64 min_order_value_micro = 8;
+  // The Hyperliquid chain the signatures are checked for, as Hyperliquid names it ("Mainnet"), and
+  // its API.
+  string hyperliquid_chain = 9;
+  string hyperliquid_api = 10;
+  // ["Gtc"]
+  repeated string tifs = 11;
+  // place.expiresAfter - serverTime: the bounds. A cancel on request's expiresAfter has the same.
+  uint64 min_life_ms = 12;
+  uint64 max_life_ms = 13;
+  // deadline - serverTime: at most. (At least min_life_ms.)
+  uint64 max_deadline_ms = 14;
+  // clear.expiresAfter - deadline: at least.
+  uint64 cancel_grace_ms = 15;
+  // A nonce's bounds around the server's clock; clear.nonce must also be at least the deadline.
+  uint64 nonce_max_age_ms = 16;
+  uint64 nonce_max_ahead_ms = 17;
+  // No action is relayed with less than this before its expiresAfter.
+  uint64 send_margin_ms = 18;
+  // The largest order, whole shares, and a user's open orders.
+  uint64 max_shares = 19;
+  uint32 open_orders = 20;
+  // Whether the book takes orders, and its expiry when known.
+  bool open = 21;
+  google.protobuf.Timestamp expiry = 22;
+  google.protobuf.Timestamp server_time = 23;
+  // "await" or "together": how matches are sent.
+  string send_mode = 24;
+}
+
+message PlaceUserHeldOrderRequest {
+  // The held order: `place` a Gtc limit order, `clear` its cancelByCloid.
+  HeldOrder order = 1;
+  // When Skew cancels what still rests: unix ms.
+  uint64 deadline_ms = 2;
+}
+
+message PlaceUserHeldOrderResponse {
+  // The order as recorded (also for the same signed bytes placed again).
+  UserHeldOrderView order = 1;
+  // Set, with no order, when the edge declines it: a stable code and a sentence.
+  UserHeldRefusal refusal = 2;
+}
+
+// UserHeldRefusal is a well-formed order the edge declines (HTTP 200). Codes: the held pool's
+// per-order codes (MAKER-SPEC §8), DEADLINE_TOO_SOON, DEADLINE_TOO_LATE, CLEAR_NONCE_TOO_LOW,
+// OPEN_ORDERS_CAP, SIGNER_NONCES_AHEAD, BOOK_NOT_OPEN, GEOFENCED, SCREENED, HALTED. TAKER_MISMATCH and
+// BETA_REQUIRED are NOT refusals: they are HTTP 403 errors, as on every route of the session's edge.
+message UserHeldRefusal {
+  string code = 1;
+  string reason = 2;
+}
+
+// CancelUserHeldOrderRequest asks to cancel one of the caller's orders now. The user is at the app,
+// so the app signs the cancel NOW: `cancel` is a cancelByCloid of the order's asset and cloid,
+// signed with an ordinary nonce (the current time) and a short expiresAfter (the terms'
+// min_life_ms to max_life_ms ahead), by the order's signer or another key of the account
+// (`signer`). Skew relays those bytes. The cancel the order was placed with, dated at the
+// deadline, is kept for the deadline and for recovery.
+message CancelUserHeldOrderRequest {
+  string order_id = 1;
+  // The freshly signed cancelByCloid: Hyperliquid's own request body. Left out, only an order
+  // nothing was sent for is cancelled (CANCEL_NOT_SIGNED otherwise).
+  HeldSigned cancel = 2;
+  // The address that signed `cancel`. Empty: the order's signer.
+  string signer = 3;
+}
+
+message CancelUserHeldOrderResponse {
+  // The order as it stands (also when the cancel was asked before, or the order had ended).
+  UserHeldOrderView order = 1;
+  // Set, with no order, when the cancel itself is declined: CANCEL_NOT_SIGNED, CANCEL_NONCE_AHEAD,
+  // BAD_CLEAR, CLEAR_MISMATCH, NO_EXPIRY, EXPIRES_TOO_SOON, EXPIRES_TOO_LATE, NONCE_OUT_OF_WINDOW,
+  // NONCE_USED, BAD_SIGNATURE, SIGNER_MISMATCH, SIGNER_NOT_AUTHORIZED, SIGNER_CHECK_UNAVAILABLE.
+  // Nothing changed: sign again and ask again.
+  UserHeldRefusal refusal = 2;
+}
+
+message GetUserHeldOrderRequest {
+  string order_id = 1;
+}
+
+message GetUserHeldOrderResponse {
+  UserHeldOrderView order = 1;
+}
+
+message ListUserHeldOrdersRequest {
+  // Only this book (0: every book).
+  uint32 book = 1;
+  repeated UserHeldOrderState states = 2;
+  uint32 limit = 3;
+  string page_token = 4;
+}
+
+message ListUserHeldOrdersResponse {
+  repeated UserHeldOrderView orders = 1;
+  string next_page_token = 2;
+}
+
+message WatchUserHeldOrdersRequest {
+  // Resume after this cursor. 0: the changes from now on.
+  uint64 cursor = 1;
+}
+
+// UserHeldOrderUpdate is one change of one of the caller's orders (type "order"), or a heartbeat.
+message UserHeldOrderUpdate {
+  // Resume after it.
+  uint64 cursor = 1;
+  // "order" or "heartbeat".
+  string type = 2;
+  UserHeldOrderView order = 3;
+  google.protobuf.Timestamp time = 4;
+}

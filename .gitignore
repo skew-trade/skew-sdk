@@ -1,0 +1,7 @@
+# Recreated by the export from the source's modules (go mod vendor recreates it online).
+/vendor/
+node_modules/
+/ts/dist/
+*.tgz
+# The privacy scan's word list, when kept locally (scripts/privacy-scan.sh).
+/.privacy-words

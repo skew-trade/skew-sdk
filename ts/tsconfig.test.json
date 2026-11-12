@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": [
+      "node"
+    ],
+    "paths": {
+      "@skew-trade/sdk": [
+        "./src/index.ts"
+      ],
+      "@skew-trade/sdk/maker": [
+        "./src/maker.ts"
+      ]
+    }
+  },
+  "include": [
+    "src",
+    "examples"
+  ],
+  "exclude": []
+}

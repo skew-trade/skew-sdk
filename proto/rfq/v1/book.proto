@@ -1,0 +1,339 @@
+syntax = "proto3";
+
+package rfq.v1;
+
+option go_package = "github.com/skew-trade/skew-sdk/gen/rfq/v1;rfqv1";
+
+// The markets feed: the composite book of each market, as the markets WebSocket serves it
+// (wss://<host>/v1/ws).
+//
+// WHAT A CLIENT RECEIVES, field by field, and nothing else:
+//
+//   snapshot  t, market, book_seq, ts, phase, expiry, result,
+//             hl {stale, reason, bids, asks}, pool {stale, reason, bids, asks},
+//             rfq {stale, reason, bids, asks}
+//   delta     the same header fields when they changed, prev_seq, the layers' changed stale and
+//             reason, and the hl, pool and rfq levels (layer, side, px, sz)
+//   tob       t, market, book_seq, ts, hl, pool, rfq
+//   state     t, market, ts, phase, expiry, series, rung, strike, result
+//   index     t, ts, markets {market, series, rung, strike, expiry, phase, layers}
+//   hello, feed, hb, ack, error, pong as below
+//
+// A client ignores a field, a frame or a layer it does not know.
+//
+// THE LAYERS. hl is Hyperliquid's whole book on the outcome (display only: Skew does not fill
+// it), pool what one order could be matched with in the held orders now, and rfq (RfqLayer, Skew
+// RFQ) indicative depth Skew may fill (not binding: an order may fill in part or not at all),
+// where the deployment shows it; without it the frames are exactly as above. book_seq counts the
+// feed's own releases: book_seq - prev_seq is always 1.
+//
+// ENCODING. JSON text frames are protojson with unpopulated fields omitted, so 64-bit integers
+// are decimal STRINGS ("book_seq":"1099511627781", "ts":"1791548964650") and a client compares
+// book_seq as a BigInt. Every multi-word field sets json_name to its proto name: the JSON is
+// snake_case (book_seq, not bookSeq) whatever the encoder's UseProtoNames, and the generated
+// TypeScript *Json types say the same. Every frame is ONE of the *Frame/Book* messages below,
+// flat, with its kind in `t`:
+//
+//   {"t":"snapshot","market":"10294","book_seq":"1099511627781",...}
+//
+// The binary subprotocol (skew.markets.v1+proto) sends the same message carried in MarketsFrame,
+// protobuf-encoded, one per binary frame.
+//
+// UNITS: prices in integer milli (445 = 0.445 USDC per share), sizes in whole shares, times in
+// unix MILLISECONDS (ts) except expiry, which is unix SECONDS.
+//
+// PACKED LEVELS. Book levels travel as flat arrays, best first: hl bids and asks are
+// [px, sz, 0, px, sz, 0, ...] triples (the third number is always 0), pool and rfq bids and asks
+// are [px, sz, ...] pairs. Bids descend in price; asks ascend.
+//
+// SEQUENCE. book_seq = epoch << 40 | n, n counting publications per market from 1. A delta's
+// prev_seq is the book_seq it applies to. A client that sees prev_seq differ from the last
+// book_seq it holds, or the epoch (book_seq >> 40) change without a snapshot, asks for a resync.
+
+// HlLayer: Hyperliquid's book on the outcome's YES coin, on the milli grid
+// (asks rounded up, bids down). Display only: Skew does not fill it.
+message HlLayer {
+  // True after 2 s without a fresh Hyperliquid frame; the layer blanks after 5 s.
+  optional bool stale = 2;
+  // Why the layer is blank, e.g. HL_FEED_DOWN.
+  optional string reason = 3;
+  // [px, sz, 0, ...], best (highest) first: sz the size at the price; the third number is
+  // always 0.
+  repeated uint32 bids = 5;
+  // [px, sz, 0, ...], best (lowest) first.
+  repeated uint32 asks = 6;
+}
+
+// PoolLayer: the held orders on the market: what one user's order can be
+// matched with at Skew now, summed per price per side, in YES space (an order
+// on the No side at q shows at 1000 - q on the other side of the book), on the
+// milli grid (asks rounded up, bids down). It names no maker and counts none;
+// what is too close to its expiry to be matched is left out. What shows is
+// matched when an order arrives and may fill in part: a level can be taken by
+// another party first, refused, or withdrawn.
+message PoolLayer {
+  // True after 3 s without word from the pool; the layer blanks after 10 s.
+  optional bool stale = 2;
+  // Why the layer is blank, e.g. POOL_DOWN.
+  optional string reason = 3;
+  // [px, sz, ...], best (highest) first.
+  repeated uint32 bids = 4;
+  // [px, sz, ...], best (lowest) first.
+  repeated uint32 asks = 5;
+}
+
+// RfqLayer: Skew RFQ, indicative depth Skew may fill on the market. Summed
+// per price per side, in YES space (a NO price q shows at 1000 - q on the bid
+// side), on the milli grid. Not binding: an order may fill in part or not at
+// all. Present only where the deployment shows it; absent otherwise.
+message RfqLayer {
+  // False: a blank layer says why in reason (the field keeps the shape every
+  // layer has).
+  optional bool stale = 1;
+  // Why the layer is blank: UNAVAILABLE (nothing to show now, whatever the
+  // cause), HALTED (nothing can be matched now, as the pool layer says).
+  // Empty when it shows.
+  optional string reason = 2;
+  // [px, sz, ...], best (highest) first.
+  repeated uint32 bids = 3;
+  // [px, sz, ...], best (lowest) first.
+  repeated uint32 asks = 4;
+}
+
+// BookSnapshot, t = "snapshot": the whole book of one market at book_seq. It
+// is what a subscribe and a resync deliver, and what replaces the client's view
+// outright.
+message BookSnapshot {
+  string t = 1;
+  // The HL outcome id, decimal.
+  string market = 2;
+  uint64 book_seq = 3 [json_name = "book_seq"];
+  // When it was published, unix ms (the server's clock).
+  int64 ts = 4;
+  // open, expired, settled.
+  string phase = 7;
+  int64 expiry = 8;
+  HlLayer hl = 12;
+  // The settled result (YES or NO), once phase is settled.
+  string result = 14;
+  // The held orders on the market; absent when there is no pool input.
+  PoolLayer pool = 16;
+  // Skew RFQ (RfqLayer), where the deployment shows it.
+  RfqLayer rfq = 18;
+}
+
+// BookLevel: one changed level in a delta. Replacement semantics: the level
+// at (layer, side, px) becomes sz; sz 0 removes it.
+message BookLevel {
+  // hl, pool or rfq (ignore a level of a layer you do not know).
+  string layer = 1;
+  // bid or ask.
+  string side = 2;
+  uint32 px = 4;
+  uint32 sz = 5;
+}
+
+// BookDelta, t = "delta": what changed since prev_seq. Header fields appear
+// only when they changed; the layers carry only their changed header fields
+// (stale, reason), never levels: the levels are in `levels`.
+message BookDelta {
+  string t = 1;
+  string market = 2;
+  uint64 book_seq = 3 [json_name = "book_seq"];
+  uint64 prev_seq = 4 [json_name = "prev_seq"];
+  int64 ts = 5;
+  repeated BookLevel levels = 6;
+  optional string phase = 9;
+  optional int64 expiry = 10;
+  HlLayer hl = 14;
+  optional string result = 16;
+  // The pool layer's changed header fields (stale, reason), never levels;
+  // present with nothing set when the layer appeared.
+  PoolLayer pool = 18;
+  // The rfq layer's changed header fields (stale, reason), never levels;
+  // present when the layer appeared.
+  RfqLayer rfq = 19;
+}
+
+// ---------------------------------------------------------------- top of book
+
+// TobHl: the best bid and ask of a layer (`hl`: Hyperliquid's book; `pool`:
+// the held orders'; `rfq`: Skew RFQ's) (0: none).
+message TobHl {
+  uint32 bid = 1;
+  uint32 ask = 2;
+}
+
+// TobFrame, t = "tob": top of book for list views, made from the snapshot at
+// book_seq, at most once a second per market and only when it changed.
+message TobFrame {
+  string t = 1;
+  string market = 2;
+  uint64 book_seq = 3 [json_name = "book_seq"];
+  int64 ts = 4;
+  TobHl hl = 5;
+  // The pool layer's best bid and ask; absent when the snapshot has no pool.
+  TobHl pool = 8;
+  // The rfq layer's best bid and ask; absent when the snapshot has no rfq
+  // layer.
+  TobHl rfq = 9;
+}
+
+// StateFrame, t = "state": a market's state, on change. A market's state and
+// book frames keep publish order.
+message StateFrame {
+  string t = 1;
+  string market = 2;
+  int64 ts = 3;
+  // open, expired, settled.
+  string phase = 4;
+  int64 expiry = 5;
+  string series = 12;
+  uint32 rung = 13;
+  string strike = 14;
+  string result = 15;
+}
+
+// IndexEntry: one live market.
+message IndexEntry {
+  string market = 1;
+  string series = 2;
+  uint32 rung = 3;
+  string strike = 4;
+  int64 expiry = 5;
+  string phase = 6;
+  // The layers it has: hl, pool (ignore a name you do not know).
+  repeated string layers = 7;
+}
+
+// IndexFrame, t = "index": the live market set, on birth or death. A market
+// leaves it an hour after settlement.
+message IndexFrame {
+  string t = 1;
+  int64 ts = 2;
+  repeated IndexEntry markets = 3;
+}
+
+// ---------------------------------------------------------------- the connection's own frames
+
+// HelloLimits: the limits the connection's tier gets.
+message HelloLimits {
+  // book subscriptions.
+  uint32 book_max = 1 [json_name = "book_max"];
+  // client messages per second, and the burst.
+  uint32 msg_rate = 2 [json_name = "msg_rate"];
+  uint32 msg_burst = 3 [json_name = "msg_burst"];
+  // subscriptions of every channel together.
+  uint32 subs_max = 4 [json_name = "subs_max"];
+}
+
+// HelloFrame, t = "hello": the first frame on every connection.
+message HelloFrame {
+  string t = 1;
+  // The protocol version (1).
+  uint32 v = 2;
+  // An opaque id of the server, for support; never for routing.
+  string server_id = 3 [json_name = "server_id"];
+  // The hb interval, ms.
+  uint32 hb_ms = 4 [json_name = "hb_ms"];
+  HelloLimits limits = 5;
+  // anon or jwt.
+  string tier = 6;
+}
+
+// FeedFrame, t = "feed": the server's view of the book feed changed. ok:
+// fresh; stale: no word for 2.5 s (grey the hl layer); down: 15 s (book
+// unavailable).
+message FeedFrame {
+  string t = 1;
+  string status = 2;
+  // Since when, unix ms.
+  int64 since = 3;
+  uint32 builder_epoch = 4 [json_name = "builder_epoch"];
+}
+
+// HeartbeatFrame, t = "hb": every 5 s. ts is the server's clock: a client
+// estimates its offset as min(ts - receive time) over the last heartbeats.
+message HeartbeatFrame {
+  string t = 1;
+  int64 ts = 2;
+  // ok, stale, down.
+  string feed = 3;
+  // How old the server's last word from the book feed is, ms.
+  uint32 builder_age_ms = 4 [json_name = "builder_age_ms"];
+  uint32 epoch = 5;
+}
+
+// AckFrame, t = "ack": an op succeeded; m lists the markets it applied to.
+message AckFrame {
+  string t = 1;
+  uint32 id = 2;
+  string op = 3;
+  string ch = 4;
+  repeated string m = 5;
+}
+
+// ErrorFrame, t = "error": an op (id) failed, wholly or for the markets in m.
+// Codes: BAD_REQUEST, UNKNOWN_MARKET, UNKNOWN_CHANNEL, TOO_MANY_SUBSCRIPTIONS,
+// RATE_LIMITED, UNAUTHORIZED, MARKET_SETTLED, INTERNAL.
+message ErrorFrame {
+  string t = 1;
+  uint32 id = 2;
+  string code = 3;
+  string msg = 4;
+  repeated string m = 5;
+}
+
+// PongFrame, t = "pong": the answer to a client ping.
+message PongFrame {
+  string t = 1;
+  uint32 id = 2;
+  int64 ts = 3;
+}
+
+// MarketsFrame is the envelope of the binary subprotocol, and the list of
+// every frame a client can receive. JSON frames are the inner message alone.
+message MarketsFrame {
+  oneof frame {
+    BookSnapshot snapshot = 1;
+    BookDelta delta = 2;
+    TobFrame tob = 3;
+    StateFrame state = 5;
+    IndexFrame index = 6;
+    FeedFrame feed = 7;
+    HeartbeatFrame hb = 8;
+    HelloFrame hello = 9;
+    AckFrame ack = 10;
+    ErrorFrame error = 11;
+    PongFrame pong = 12;
+  }
+}
+
+// ---------------------------------------------------------------- client -> server
+
+// ClientOp: one client message, a JSON text frame of at most 4 KB (a binary
+// client may send it protobuf-encoded in a binary frame).
+//
+//   {"op":"subscribe","id":1,"ch":"book","m":["10294","10213"],"since":{"10294":"1099511627781"}}
+//   {"op":"subscribe","id":2,"ch":"tob","m":["*"]}
+//   {"op":"unsubscribe","id":3,"ch":"book","m":["10213"]}
+//   {"op":"resync","id":4,"m":["10294"]}
+//   {"op":"auth","id":5,"token":"<jwt>"}
+//   {"op":"ping","id":6}
+//
+// The server also accepts `m` as a bare string ("*" or one market id).
+message ClientOp {
+  // subscribe, unsubscribe, resync, auth, ping.
+  string op = 1;
+  // Echoed in the ack or error.
+  uint32 id = 2;
+  // book, tob, state, index.
+  string ch = 3;
+  // Market ids, or ["*"] for every market (book needs a token for "*").
+  repeated string m = 4;
+  // book only: the book_seq the client already holds per market. When it is
+  // the current one no snapshot is sent ("up to date").
+  map<string, uint64> since = 5;
+  // auth only: a session JWT. It raises limits; it never gates data.
+  string token = 6;
+}

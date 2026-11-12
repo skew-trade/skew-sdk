@@ -1,0 +1,12 @@
+# TypeScript: the *Json types, into ../ts/src/gen (committed), with protoc-gen-es from
+# ts/node_modules (the version ts/package.json pins). Run with --include-imports: rfq.proto and
+# held.proto import google/api/annotations.proto.
+version: v2
+managed:
+  enabled: true
+plugins:
+  - local: protoc-gen-es
+    out: ../ts/src/gen
+    opt:
+      - target=ts
+      - json_types=true
